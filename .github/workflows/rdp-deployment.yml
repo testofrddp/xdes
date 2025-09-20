@@ -1,0 +1,341 @@
+name: RDP Server Deployment (Production)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Force run even if another instance is running'
+        required: false
+        default: 'false'
+
+jobs:
+  deploy-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write  # Required to push connection details back to repository
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: System Information and Prerequisites
+      run: |
+        echo "=== SYSTEM INFORMATION ==="
+        echo "OS: $env:OS"
+        echo "Processor: $env:PROCESSOR_ARCHITECTURE"
+        echo "User: $env:USERNAME"
+        echo "PowerShell Version: $($PSVersionTable.PSVersion)"
+        echo "Current Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+        echo "=============================="
+
+        # Check SSH availability
+        try {
+          $sshVersion = ssh -V 2>&1
+          echo "SSH Version: $sshVersion"
+        } catch {
+          echo "WARNING: SSH not found, attempting to install OpenSSH..."
+          try {
+            Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+            echo "✓ OpenSSH Client installed"
+          } catch {
+            echo "✗ Failed to install OpenSSH: $_"
+            exit 1
+          }
+        }
+
+    - name: Enhanced RDP Configuration
+      run: |
+        echo "=== RDP CONFIGURATION ==="
+        echo "Configuring Windows Remote Desktop with enhanced security..."
+
+        try {
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          echo "✓ Remote Desktop enabled"
+
+          # Configure firewall rules
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          echo "✓ Firewall rules configured"
+
+          # Disable Network Level Authentication (can cause issues with tunneled connections)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          echo "✓ Network Level Authentication disabled for better tunnel compatibility"
+
+          # Set security layer to RDP Security Layer
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "SecurityLayer" -Value 0
+          echo "✓ Security layer set to RDP"
+
+          # Set encryption level to low for better compatibility
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "MinEncryptionLevel" -Value 1
+          echo "✓ Encryption level set for compatibility"
+
+          # Configure user account
+          $username = "runneradmin"
+          $password = "P@ssw0rd!"
+          Set-LocalUser -Name $username -Password (ConvertTo-SecureString -AsPlainText $password -Force)
+          echo "✓ User credentials configured"
+
+          # Restart RDP service to apply configuration changes
+          echo "Restarting RDP service to apply configuration..."
+          Restart-Service -Name "TermService" -Force
+          Start-Sleep -Seconds 3
+
+          # Verify RDP service
+          $rdpService = Get-Service -Name "TermService"
+          if ($rdpService.Status -eq "Running") {
+            echo "✓ RDP service restarted and running"
+          } else {
+            echo "⚠ RDP service not running, attempting to start..."
+            Start-Service -Name "TermService"
+            Start-Sleep -Seconds 2
+            $rdpService = Get-Service -Name "TermService"
+            if ($rdpService.Status -eq "Running") {
+              echo "✓ RDP service started successfully"
+            } else {
+              echo "✗ Failed to start RDP service"
+            }
+          }
+
+          # Check if RDP port is listening
+          Start-Sleep -Seconds 2  # Give service time to bind to port
+          $rdpPort = Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue
+          if ($rdpPort) {
+            echo "✓ RDP port 3389 is listening"
+            echo "  Listening on: $($rdpPort.LocalAddress):$($rdpPort.LocalPort)"
+          } else {
+            echo "⚠ RDP port 3389 not detected"
+            echo "Checking all listening ports..."
+            Get-NetTCPConnection -State Listen | Where-Object {$_.LocalPort -eq 3389} | ForEach-Object {
+              echo "  Found RDP port: $($_.LocalAddress):$($_.LocalPort)"
+            }
+          }
+
+          # Additional diagnostics
+          echo "=== RDP DIAGNOSTICS ==="
+          echo "Current RDP configuration:"
+          $rdpConfig = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          echo "  UserAuthentication: $($rdpConfig.UserAuthentication)"
+          echo "  SecurityLayer: $($rdpConfig.SecurityLayer)"
+          echo "  MinEncryptionLevel: $($rdpConfig.MinEncryptionLevel)"
+
+          $tsConfig = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          echo "  fDenyTSConnections: $($tsConfig.fDenyTSConnections)"
+
+          echo "=== RDP CONFIGURATION COMPLETE ==="
+
+        } catch {
+          echo "✗ RDP configuration failed: $_"
+          echo "This may cause connection issues"
+        }
+
+    - name: Download and Setup Ngrok
+      run: |
+        echo "=== NGROK SETUP ==="
+        echo "Downloading and configuring Ngrok..."
+
+        try {
+          Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip -TimeoutSec 30
+          Expand-Archive ngrok.zip -DestinationPath ngrok -Force
+          echo "✓ Ngrok downloaded and extracted"
+        } catch {
+          echo "✗ Failed to download Ngrok: $_"
+          exit 1
+        }
+
+    - name: Setup Ngrok Auth
+      run: |
+        echo "Configuring Ngrok authentication..."
+        try {
+          .\ngrok\ngrok.exe authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+          echo "✓ Ngrok authentication configured"
+        } catch {
+          echo "✗ Failed to configure Ngrok auth: $_"
+          exit 1
+        }
+
+    - name: Create Ngrok Tunnel (Enhanced)
+      run: |
+        echo "=== NGROK TUNNEL SETUP ==="
+        echo "Starting enhanced Ngrok tunnel..."
+
+        # Check for existing Ngrok sessions first
+        echo "Checking for existing Ngrok sessions..."
+        try {
+          $existingSessions = Invoke-RestMethod -Uri "https://api.ngrok.com/tunnels" -Headers @{"Authorization"="Bearer ${{ secrets.NGROK_AUTH_TOKEN }}"} -Method Get -TimeoutSec 10
+          if ($existingSessions.tunnels -and $existingSessions.tunnels.Count -gt 0) {
+            echo "⚠️  Found $($existingSessions.tunnels.Count) existing Ngrok session(s)"
+            echo "Free Ngrok accounts are limited to 1 simultaneous session"
+            echo "Waiting for existing sessions to close..."
+
+            # Wait up to 2 minutes for existing sessions to close
+            for ($wait = 0; $wait -lt 120; $wait += 10) {
+              Start-Sleep -Seconds 10
+              try {
+                $checkSessions = Invoke-RestMethod -Uri "https://api.ngrok.com/tunnels" -Headers @{"Authorization"="Bearer ${{ secrets.NGROK_AUTH_TOKEN }}"} -Method Get -TimeoutSec 5
+                if (-not $checkSessions.tunnels -or $checkSessions.tunnels.Count -eq 0) {
+                  echo "✓ Existing sessions have closed, proceeding..."
+                  break
+                }
+                echo "Still waiting... ($wait/120 seconds)"
+              } catch {
+                echo "Could not check session status, proceeding anyway..."
+                break
+              }
+            }
+          } else {
+            echo "✓ No existing Ngrok sessions found"
+          }
+        } catch {
+          echo "Could not check existing sessions (API might be unavailable), proceeding..."
+        }
+
+        # Start Ngrok tunnel with enhanced monitoring
+        try {
+          Start-Process -FilePath ".\ngrok\ngrok.exe" -ArgumentList "tcp", "3389", "--log=stdout" -RedirectStandardOutput "ngrok.log" -RedirectStandardError "ngrok_error.log" -NoNewWindow
+          echo "✓ Ngrok process started"
+        } catch {
+          echo "✗ Failed to start Ngrok: $_"
+          exit 1
+        }
+
+        # Wait for tunnel establishment with enhanced monitoring
+        $tunnelUrl = ""
+        $connectionEstablished = $false
+
+        for ($i = 0; $i -lt 60; $i++) {
+          Start-Sleep -Seconds 1
+
+          # Try API first (most reliable)
+          try {
+            $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -Method Get -TimeoutSec 5
+            $tunnel = $response.tunnels | Where-Object { $_.proto -eq "tcp" }
+            if ($tunnel -and $tunnel.public_url) {
+              $tunnelUrl = $tunnel.public_url
+              $connectionEstablished = $true
+              echo "✓ Ngrok tunnel established via API: $tunnelUrl"
+              break
+            }
+          } catch {
+            # API not ready yet, continue waiting
+          }
+
+          # Fallback to log parsing
+          if (Test-Path "ngrok.log") {
+            $logContent = Get-Content "ngrok.log" -Raw
+            if ($logContent -match "url=tcp://([^\s\r\n]+)") {
+              $tunnelUrl = "tcp://$($matches[1])"
+              $connectionEstablished = $true
+              echo "✓ Ngrok tunnel found in logs: $tunnelUrl"
+              break
+            }
+          }
+
+          if ($i % 10 -eq 0 -and $i -gt 0) {
+            echo "Waiting for Ngrok tunnel... ($i/60 seconds)"
+          }
+        }
+
+        if ($connectionEstablished -and $tunnelUrl) {
+          $connectionDetails = @{
+            host = $tunnelUrl
+            username = "runneradmin"
+            password = "P@ssw0rd!"
+            status = "ready"
+            provider = "ngrok"
+            establishedAt = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            connectionString = "mstsc /v:$($tunnelUrl -replace 'tcp://', '') /u:runneradmin"
+          }
+
+          echo "=== RDP CONNECTION DETAILS ==="
+          echo "Host: $tunnelUrl"
+          echo "Username: runneradmin"
+          echo "Password: P@ssw0rd!"
+          echo "Provider: Ngrok"
+          echo "=============================="
+
+          $jsonDetails = $connectionDetails | ConvertTo-Json -Depth 10
+          $jsonDetails | Out-File -FilePath "connection-details.json" -Encoding UTF8
+
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          git add connection-details.json
+          git commit -m "Add RDP connection details [ngrok-automated]"
+          git push origin main
+
+        } else {
+          echo "=== NGROK TUNNEL FAILED ==="
+          echo "Failed to establish Ngrok tunnel"
+
+          # Check for specific error patterns
+          $errorFound = $false
+          if (Test-Path "ngrok.log") {
+            echo "Ngrok logs:"
+            $logContent = Get-Content "ngrok.log" -Raw
+            echo $logContent
+
+            # Check for session limit error
+            if ($logContent -match "ERR_NGROK_108" -or $logContent -match "limited to 1 simultaneous") {
+              echo ""
+              echo "🚨 NGROK SESSION LIMIT EXCEEDED 🚨"
+              echo "Your Ngrok account is limited to 1 simultaneous session."
+              echo "This usually happens when:"
+              echo "1. Another workflow is running simultaneously"
+              echo "2. You have an active Ngrok session elsewhere"
+              echo "3. A previous session didn't close properly"
+              echo ""
+              echo "Solutions:"
+              echo "1. Wait for other sessions to complete"
+              echo "2. Check https://dashboard.ngrok.com/agents for active sessions"
+              echo "3. Upgrade to Ngrok Pro for multiple sessions"
+              echo "4. Use a different tunneling provider (localhost.run, Serveo, Pinggy)"
+              $errorFound = $true
+            }
+          }
+
+          if (Test-Path "ngrok_error.log") {
+            echo "Ngrok errors:"
+            Get-Content "ngrok_error.log"
+          }
+
+          if (-not $errorFound) {
+            echo "Check the logs above for specific error details."
+          }
+
+          exit 1
+        }
+    - name: Keep RDP Server Active
+      run: |
+        echo "=== RDP SERVER ACTIVE ==="
+        echo "RDP server is now running and accessible"
+        echo "Session will remain active for the duration of this workflow"
+        echo "Maximum session time: 90 minutes (GitHub Actions limit)"
+        echo ""
+        echo "Connection established at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+        echo "Estimated session end: $(Get-Date -Date (Get-Date).AddMinutes(85) -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+        echo ""
+        echo "Keeping session alive..."
+
+        # Keep alive with periodic status updates
+        $startTime = Get-Date
+        $maxDuration = 85 * 60  # 85 minutes in seconds
+        $updateInterval = 300   # 5 minutes
+
+        while ((Get-Date) -lt $startTime.AddSeconds($maxDuration)) {
+          Start-Sleep -Seconds $updateInterval
+          $elapsed = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+          $remaining = [math]::Round(85 - $elapsed, 1)
+          echo "Session active for $elapsed minutes, $remaining minutes remaining"
+
+          # Verify RDP service is still running
+          $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+          if ($rdpService -and $rdpService.Status -eq "Running") {
+            echo "✓ RDP service healthy"
+          } else {
+            echo "⚠ RDP service issue detected"
+          }
+        }
+
+        echo "Session time limit reached, workflow ending"
